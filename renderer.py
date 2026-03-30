@@ -5,6 +5,19 @@ import threading
 from abc import ABC, abstractmethod
 from typing import Any, Callable
 
+from gi_support import (
+    BoxApi,
+    DisplayApi,
+    GdkApi,
+    GestureClickApi,
+    GlibApi,
+    GtkApi,
+    LabelApi,
+    LayerShellApi,
+    ListModelApi,
+    MonitorApi,
+    WindowApi,
+)
 from notifications import (
     CLOSE_REASON_DISMISSED,
     CLOSE_REASON_EXPIRED,
@@ -48,14 +61,14 @@ class _BaseGtkRenderer(NotificationRenderer):
             gi.require_version("Gtk", "4.0")
             gtk_major = 4
 
-        from gi.repository import Gtk, Gdk, GLib
+        from gi.repository import Gtk, Gdk, GLib  # type: ignore[attr-defined]
 
         layer_shell = None
         if gtk_major == 3:
             for version in ("0.1", "0"):
                 try:
                     gi.require_version("GtkLayerShell", version)
-                    from gi.repository import GtkLayerShell
+                    from gi.repository import GtkLayerShell  # type: ignore[attr-defined]
 
                     layer_shell = GtkLayerShell
                     break
@@ -65,21 +78,21 @@ class _BaseGtkRenderer(NotificationRenderer):
             for version in ("1.0", "0"):
                 try:
                     gi.require_version("Gtk4LayerShell", version)
-                    from gi.repository import Gtk4LayerShell
+                    from gi.repository import Gtk4LayerShell  # type: ignore[attr-defined]
 
                     layer_shell = Gtk4LayerShell
                     break
                 except ValueError:
                     continue
 
-        self._Gtk = Gtk
-        self._Gdk = Gdk
-        self._GLib = GLib
         self._gtk_major = gtk_major
-        self._GtkLayerShell = layer_shell
+        self._gtk_api = GtkApi.from_module(Gtk)
+        self._gdk_api = GdkApi.from_module(Gdk)
+        self._glib_api = GlibApi.from_module(GLib)
+        self._layer_shell_api = LayerShellApi.from_module(layer_shell)
         self._main_loop = None
 
-        if self._GtkLayerShell is None:
+        if self._layer_shell_api is None:
             print(
                 "[custom-notification-daemon] Running without GtkLayerShell. "
                 "Notifications will be regular windows. "
@@ -95,14 +108,25 @@ class _BaseGtkRenderer(NotificationRenderer):
         self._timeout_sources: dict[int, int] = {}
 
         if self._gtk_major == 3:
-            gtk_thread = threading.Thread(target=Gtk.main, daemon=True)
+            if self._gtk_api.main is None:
+                raise RuntimeError("Gtk.main is unavailable")
+            gtk_thread = threading.Thread(target=self._gtk_api.main, daemon=True)
         else:
-            self._main_loop = GLib.MainLoop()
+            if self._glib_api.main_loop_ctor is None:
+                raise RuntimeError("GLib.MainLoop is unavailable")
+            self._main_loop = self._glib_api.main_loop_ctor()
             gtk_thread = threading.Thread(target=self._main_loop.run, daemon=True)
         gtk_thread.start()
 
     def show(self, notification: Notification) -> None:
-        self._GLib.idle_add(self._create_window, notification)
+        self._run_on_main_thread(self._create_window, notification)
+
+    def _run_on_main_thread(self, callback: Callable[..., Any], *args: Any) -> None:
+        idle_add = self._glib_api.idle_add
+        if idle_add is not None:
+            idle_add(callback, *args)
+            return
+        callback(*args)
 
     @abstractmethod
     def _create_window(self, notification: Notification) -> bool:
@@ -110,7 +134,7 @@ class _BaseGtkRenderer(NotificationRenderer):
         ...
 
     def close(self, notification_id: int) -> None:
-        self._GLib.idle_add(
+        self._run_on_main_thread(
             self._destroy_window,
             notification_id,
             False,
@@ -137,7 +161,8 @@ class _BaseGtkRenderer(NotificationRenderer):
 
         if win is not None:
             if timeout_source is not None:
-                self._GLib.source_remove(timeout_source)
+                if self._glib_api.source_remove is not None:
+                    self._glib_api.source_remove(timeout_source)
             win.destroy()
             if emit_closed:
                 self._on_closed(notification_id, close_reason)
@@ -145,29 +170,37 @@ class _BaseGtkRenderer(NotificationRenderer):
         return False
 
     def _bind_click_to_dismiss(self, widget: Any, notification_id: int) -> None:
+        win_api = WindowApi.from_window(widget)
         if self._gtk_major == 3:
-            if hasattr(widget, "add_events") and hasattr(self._Gdk, "EventMask"):
-                widget.add_events(self._Gdk.EventMask.BUTTON_PRESS_MASK)
-            widget.connect(
-                "button-press-event",
-                self._on_notification_clicked_gtk3,
-                notification_id,
-            )
+            if (
+                win_api.add_events is not None
+                and self._gdk_api.event_mask_button_press is not None
+            ):
+                win_api.add_events(self._gdk_api.event_mask_button_press)
+            if win_api.connect is not None:
+                win_api.connect(
+                    "button-press-event",
+                    self._on_notification_clicked_gtk3,
+                    notification_id,
+                )
             return
 
         if (
             self._gtk_major == 4
-            and hasattr(self._Gtk, "GestureClick")
-            and hasattr(widget, "add_controller")
+            and self._gtk_api.gesture_click_ctor is not None
+            and win_api.add_controller is not None
         ):
-            click = self._Gtk.GestureClick()
-            click.set_button(1)
-            click.connect(
-                "pressed",
-                self._on_notification_clicked_gtk4,
-                notification_id,
-            )
-            widget.add_controller(click)
+            click = self._gtk_api.gesture_click_ctor()
+            click_api = GestureClickApi.from_gesture(click)
+            if click_api.set_button is not None:
+                click_api.set_button(1)
+            if click_api.connect is not None:
+                click_api.connect(
+                    "pressed",
+                    self._on_notification_clicked_gtk4,
+                    notification_id,
+                )
+            win_api.add_controller(click)
 
     def _on_notification_clicked_gtk3(
         self,
@@ -216,27 +249,34 @@ class _BaseGtkRenderer(NotificationRenderer):
         else:
             label.set_wrap(enabled)
 
-    def _get_primary_monitor(self, gdk_module: Any) -> Any:
-        display = gdk_module.Display.get_default()
+    def _get_primary_monitor(self) -> Any:
+        if self._gdk_api.display_get_default is None:
+            return None
+        display = self._gdk_api.display_get_default()
         if display is None:
             return None
 
-        if hasattr(display, "get_primary_monitor"):
-            monitor = display.get_primary_monitor()
+        display_api = DisplayApi.from_display(display)
+
+        if display_api.get_primary_monitor is not None:
+            monitor = display_api.get_primary_monitor()
             if monitor is not None:
                 return monitor
 
-        if hasattr(display, "get_n_monitors") and hasattr(display, "get_monitor"):
-            n_monitors = display.get_n_monitors()
+        if display_api.get_n_monitors and display_api.get_monitor:
+            n_monitors = display_api.get_n_monitors()
             if n_monitors > 0:
-                monitor = display.get_monitor(0)
+                monitor = display_api.get_monitor(0)
                 if monitor is not None:
                     return monitor
 
-        if hasattr(display, "get_monitors"):
-            monitors = display.get_monitors()
-            if monitors and monitors.get_n_items() > 0:
-                return monitors.get_item(0)
+        if display_api.get_monitors:
+            monitors = display_api.get_monitors()
+            if monitors is not None:
+                model_api = ListModelApi.from_model(monitors)
+                if model_api.get_n_items and model_api.get_item:
+                    if model_api.get_n_items() > 0:
+                        return model_api.get_item(0)
 
         return None
 
@@ -248,34 +288,39 @@ class _BaseGtkRenderer(NotificationRenderer):
                 CLOSE_REASON_REPLACED,
             )
 
-    def _create_popup_window(self, gtk_module: Any) -> Any:
-        if self._gtk_major == 3:
-            return gtk_module.Window(type=gtk_module.WindowType.POPUP)
-        return gtk_module.Window()
+    def _create_popup_window(self) -> Any:
+        if self._gtk_api.window_ctor is None:
+            return None
+        if self._gtk_major == 3 and self._gtk_api.window_type_popup is not None:
+            return self._gtk_api.window_ctor(type=self._gtk_api.window_type_popup)
+        return self._gtk_api.window_ctor()
 
-    def _configure_common_window(
-        self, win: Any, gdk_module: Any, opacity: float | None = None
-    ) -> None:
+    def _configure_common_window(self, win: Any, opacity: float | None = None) -> None:
+        win_api = WindowApi.from_window(win)
         win.set_decorated(False)
         win.set_resizable(False)
-        if opacity is not None and hasattr(win, "set_opacity"):
-            win.set_opacity(opacity)
-        if hasattr(win, "set_keep_above"):
-            win.set_keep_above(True)
-        if hasattr(win, "set_accept_focus"):
-            win.set_accept_focus(False)
-        if hasattr(win, "set_focus_on_map"):
-            win.set_focus_on_map(False)
-        if hasattr(win, "set_can_focus"):
-            win.set_can_focus(False)
-        if hasattr(win, "set_focusable"):
-            win.set_focusable(False)
-        if hasattr(win, "set_skip_taskbar_hint"):
-            win.set_skip_taskbar_hint(True)
-        if hasattr(win, "set_skip_pager_hint"):
-            win.set_skip_pager_hint(True)
-        if self._gtk_major == 3 and hasattr(gdk_module, "WindowTypeHint"):
-            win.set_type_hint(gdk_module.WindowTypeHint.NOTIFICATION)
+        if opacity is not None and win_api.set_opacity is not None:
+            win_api.set_opacity(opacity)
+        if win_api.set_keep_above is not None:
+            win_api.set_keep_above(True)
+        if win_api.set_accept_focus is not None:
+            win_api.set_accept_focus(False)
+        if win_api.set_focus_on_map is not None:
+            win_api.set_focus_on_map(False)
+        if win_api.set_can_focus is not None:
+            win_api.set_can_focus(False)
+        if win_api.set_focusable is not None:
+            win_api.set_focusable(False)
+        if win_api.set_skip_taskbar_hint is not None:
+            win_api.set_skip_taskbar_hint(True)
+        if win_api.set_skip_pager_hint is not None:
+            win_api.set_skip_pager_hint(True)
+        if (
+            self._gtk_major == 3
+            and win_api.set_type_hint is not None
+            and self._gdk_api.window_type_notification is not None
+        ):
+            win_api.set_type_hint(self._gdk_api.window_type_notification)
 
     def _present_window(self, win: Any, content: Any) -> None:
         if self._gtk_major == 3:
@@ -295,7 +340,9 @@ class _BaseGtkRenderer(NotificationRenderer):
             if notification.expire_timeout > 0
             else self._DEFAULT_TIMEOUT_MS
         )
-        timeout_source = self._GLib.timeout_add(
+        if self._glib_api.timeout_add is None:
+            return
+        timeout_source = self._glib_api.timeout_add(
             timeout_ms,
             self._destroy_window,
             notification.id,
@@ -323,87 +370,120 @@ class ToastRenderer(_BaseGtkRenderer):
     # ------------------------------------------------------------------ #
 
     def _create_window(self, notification: Notification) -> bool:
-        Gtk, Gdk, GLib = self._Gtk, self._Gdk, self._GLib
-        GtkLayerShell = self._GtkLayerShell
+        gtk_api = self._gtk_api
+        glib_api = self._glib_api
+        layer_shell_api = self._layer_shell_api
 
         self._replace_existing_notification(notification)
 
-        win = self._create_popup_window(Gtk)
-        self._configure_common_window(win, Gdk)
+        win = self._create_popup_window()
+        if win is None:
+            return False
+        self._configure_common_window(win)
 
         self._bind_click_to_dismiss(win, notification.id)
 
-        if GtkLayerShell is not None:
+        if layer_shell_api is not None:
             # Configure as layer-shell surface when bindings are available.
-            GtkLayerShell.init_for_window(win)
-            GtkLayerShell.set_layer(win, GtkLayerShell.Layer.TOP)
-            monitor = self._get_primary_monitor(Gdk)
-            if monitor is not None:
-                GtkLayerShell.set_monitor(win, monitor)
+            if layer_shell_api.init_for_window is not None:
+                layer_shell_api.init_for_window(win)
+            if (
+                layer_shell_api.set_layer is not None
+                and layer_shell_api.layer_top is not None
+            ):
+                layer_shell_api.set_layer(win, layer_shell_api.layer_top)
+            monitor = self._get_primary_monitor()
+            if monitor is not None and layer_shell_api.set_monitor is not None:
+                layer_shell_api.set_monitor(win, monitor)
 
             # Position as a toast in the top-right corner.
-            GtkLayerShell.set_anchor(win, GtkLayerShell.Edge.TOP, True)
-            GtkLayerShell.set_anchor(win, GtkLayerShell.Edge.LEFT, False)
-            GtkLayerShell.set_anchor(win, GtkLayerShell.Edge.RIGHT, True)
-            if hasattr(GtkLayerShell, "set_margin"):
-                GtkLayerShell.set_margin(
-                    win, GtkLayerShell.Edge.TOP, self._TOAST_MARGIN
-                )
-                GtkLayerShell.set_margin(
-                    win, GtkLayerShell.Edge.RIGHT, self._TOAST_MARGIN
-                )
+            if layer_shell_api.set_anchor is not None:
+                if layer_shell_api.edge_top is not None:
+                    layer_shell_api.set_anchor(win, layer_shell_api.edge_top, True)
+                if layer_shell_api.edge_left is not None:
+                    layer_shell_api.set_anchor(win, layer_shell_api.edge_left, False)
+                if layer_shell_api.edge_right is not None:
+                    layer_shell_api.set_anchor(win, layer_shell_api.edge_right, True)
+            if layer_shell_api.set_margin is not None:
+                if layer_shell_api.edge_top is not None:
+                    layer_shell_api.set_margin(
+                        win, layer_shell_api.edge_top, self._TOAST_MARGIN
+                    )
+                if layer_shell_api.edge_right is not None:
+                    layer_shell_api.set_margin(
+                        win, layer_shell_api.edge_right, self._TOAST_MARGIN
+                    )
 
             # Avoid taking keyboard focus like dunst.
-            if hasattr(GtkLayerShell, "set_keyboard_mode") and hasattr(
-                GtkLayerShell, "KeyboardMode"
+            if (
+                layer_shell_api.set_keyboard_mode is not None
+                and layer_shell_api.keyboard_mode_none is not None
             ):
-                GtkLayerShell.set_keyboard_mode(
-                    win,
-                    GtkLayerShell.KeyboardMode.NONE,
+                layer_shell_api.set_keyboard_mode(
+                    win, layer_shell_api.keyboard_mode_none
                 )
 
         # Set size
         win.set_default_size(self._TOAST_WIDTH, self._TOAST_HEIGHT)
-        if GtkLayerShell is not None:
+        if (
+            layer_shell_api is not None
+            and layer_shell_api.set_exclusive_zone is not None
+        ):
             # A zero exclusive-zone draws over existing windows instead of
             # reserving workspace space from the compositor.
-            GtkLayerShell.set_exclusive_zone(win, 0)
+            layer_shell_api.set_exclusive_zone(win, 0)
 
         # Build UI
-        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        if gtk_api.box_ctor is None or gtk_api.orientation_vertical is None:
+            return False
+        outer = gtk_api.box_ctor(orientation=gtk_api.orientation_vertical, spacing=4)
         outer.set_margin_top(8)
         outer.set_margin_bottom(8)
         outer.set_margin_start(16)
         outer.set_margin_end(16)
 
         if notification.app_name:
-            app_lbl = Gtk.Label(label=notification.app_name)
+            if gtk_api.label_ctor is None:
+                return False
+            app_lbl = gtk_api.label_ctor(label=notification.app_name)
             app_lbl.set_xalign(0.0)
             app_lbl.get_style_context().add_class("dim-label")
             self._box_add(outer, app_lbl)
 
         if notification.summary:
-            summary_lbl = Gtk.Label()
-            summary_lbl.set_markup(
-                f"<b>{GLib.markup_escape_text(notification.summary)}</b>"
-            )
+            if gtk_api.label_ctor is None:
+                return False
+            summary_lbl = gtk_api.label_ctor()
+            escaped_summary = notification.summary
+            if glib_api.markup_escape_text is not None:
+                escaped_summary = glib_api.markup_escape_text(notification.summary)
+            summary_lbl.set_markup(f"<b>{escaped_summary}</b>")
             summary_lbl.set_xalign(0.0)
             self._set_label_wrap(summary_lbl, True)
             summary_lbl.set_max_width_chars(60)
             self._box_add(outer, summary_lbl)
 
         if notification.body:
-            body_lbl = Gtk.Label(label=notification.body)
+            if gtk_api.label_ctor is None:
+                return False
+            body_lbl = gtk_api.label_ctor(label=notification.body)
             body_lbl.set_xalign(0.0)
             self._set_label_wrap(body_lbl, True)
             body_lbl.set_max_width_chars(60)
             self._box_add(outer, body_lbl)
 
-        action_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        if gtk_api.box_ctor is None or gtk_api.orientation_horizontal is None:
+            return False
+        action_row = gtk_api.box_ctor(
+            orientation=gtk_api.orientation_horizontal,
+            spacing=6,
+        )
         action_pairs = self._parse_actions(notification.actions)
         if action_pairs:
             for action_key, action_label in action_pairs:
-                btn = Gtk.Button(label=action_label)
+                if gtk_api.button_ctor is None:
+                    return False
+                btn = gtk_api.button_ctor(label=action_label)
                 btn.connect(
                     "clicked",
                     self._on_action_clicked,
@@ -440,97 +520,136 @@ class BannerRenderer(_BaseGtkRenderer):
     # ------------------------------------------------------------------ #
 
     def _create_window(self, notification: Notification) -> bool:
-        Gtk, Gdk, GLib = self._Gtk, self._Gdk, self._GLib
-        GtkLayerShell = self._GtkLayerShell
+        gtk_api = self._gtk_api
+        glib_api = self._glib_api
+        layer_shell_api = self._layer_shell_api
 
         self._replace_existing_notification(notification)
 
-        win = self._create_popup_window(Gtk)
-        self._configure_common_window(win, Gdk, opacity=self._BANNER_OPACITY)
+        win = self._create_popup_window()
+        if win is None:
+            return False
+        self._configure_common_window(win, opacity=self._BANNER_OPACITY)
 
         self._bind_click_to_dismiss(win, notification.id)
 
-        if GtkLayerShell is not None:
+        if layer_shell_api is not None:
             # Configure as layer-shell surface when bindings are available.
-            GtkLayerShell.init_for_window(win)
-            GtkLayerShell.set_layer(win, GtkLayerShell.Layer.TOP)
-            monitor = self._get_primary_monitor(Gdk)
-            if monitor is not None:
-                GtkLayerShell.set_monitor(win, monitor)
+            if layer_shell_api.init_for_window is not None:
+                layer_shell_api.init_for_window(win)
+            if (
+                layer_shell_api.set_layer is not None
+                and layer_shell_api.layer_top is not None
+            ):
+                layer_shell_api.set_layer(win, layer_shell_api.layer_top)
+            monitor = self._get_primary_monitor()
+            if monitor is not None and layer_shell_api.set_monitor is not None:
+                layer_shell_api.set_monitor(win, monitor)
 
             # Position as a full-width centered banner across the middle.
-            GtkLayerShell.set_anchor(win, GtkLayerShell.Edge.TOP, True)
-            GtkLayerShell.set_anchor(win, GtkLayerShell.Edge.BOTTOM, False)
-            GtkLayerShell.set_anchor(win, GtkLayerShell.Edge.LEFT, True)
-            GtkLayerShell.set_anchor(win, GtkLayerShell.Edge.RIGHT, True)
-            if hasattr(GtkLayerShell, "set_margin"):
-                top_margin = self._banner_top_margin(Gdk)
-                GtkLayerShell.set_margin(win, GtkLayerShell.Edge.TOP, top_margin)
-                GtkLayerShell.set_margin(
-                    win, GtkLayerShell.Edge.LEFT, self._BANNER_MARGIN
-                )
-                GtkLayerShell.set_margin(
-                    win, GtkLayerShell.Edge.RIGHT, self._BANNER_MARGIN
-                )
+            if layer_shell_api.set_anchor is not None:
+                if layer_shell_api.edge_top is not None:
+                    layer_shell_api.set_anchor(win, layer_shell_api.edge_top, True)
+                if layer_shell_api.edge_bottom is not None:
+                    layer_shell_api.set_anchor(win, layer_shell_api.edge_bottom, False)
+                if layer_shell_api.edge_left is not None:
+                    layer_shell_api.set_anchor(win, layer_shell_api.edge_left, True)
+                if layer_shell_api.edge_right is not None:
+                    layer_shell_api.set_anchor(win, layer_shell_api.edge_right, True)
+            if layer_shell_api.set_margin is not None:
+                top_margin = self._banner_top_margin()
+                if layer_shell_api.edge_top is not None:
+                    layer_shell_api.set_margin(
+                        win, layer_shell_api.edge_top, top_margin
+                    )
+                if layer_shell_api.edge_left is not None:
+                    layer_shell_api.set_margin(
+                        win, layer_shell_api.edge_left, self._BANNER_MARGIN
+                    )
+                if layer_shell_api.edge_right is not None:
+                    layer_shell_api.set_margin(
+                        win, layer_shell_api.edge_right, self._BANNER_MARGIN
+                    )
 
             # Avoid taking keyboard focus like dunst.
-            if hasattr(GtkLayerShell, "set_keyboard_mode") and hasattr(
-                GtkLayerShell, "KeyboardMode"
+            if (
+                layer_shell_api.set_keyboard_mode is not None
+                and layer_shell_api.keyboard_mode_none is not None
             ):
-                GtkLayerShell.set_keyboard_mode(
-                    win,
-                    GtkLayerShell.KeyboardMode.NONE,
+                layer_shell_api.set_keyboard_mode(
+                    win, layer_shell_api.keyboard_mode_none
                 )
 
         # Set size
-        win.set_default_size(self._banner_width(Gdk), self._BANNER_HEIGHT)
-        if GtkLayerShell is not None:
+        win.set_default_size(self._banner_width(), self._BANNER_HEIGHT)
+        if (
+            layer_shell_api is not None
+            and layer_shell_api.set_exclusive_zone is not None
+        ):
             # A zero exclusive-zone draws over existing windows instead of
             # reserving workspace space from the compositor.
-            GtkLayerShell.set_exclusive_zone(win, 0)
+            layer_shell_api.set_exclusive_zone(win, 0)
         else:
             # Best-effort centering when layer-shell bindings are unavailable.
-            self._position_fallback_window_center(win, Gdk)
+            self._position_fallback_window_center(win)
 
         # Build UI
-        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        if hasattr(outer, "set_hexpand"):
-            outer.set_hexpand(True)
+        if gtk_api.box_ctor is None or gtk_api.orientation_vertical is None:
+            return False
+        outer = gtk_api.box_ctor(orientation=gtk_api.orientation_vertical, spacing=4)
+        outer_api = BoxApi.from_box(outer)
+        if outer_api.set_hexpand is not None:
+            outer_api.set_hexpand(True)
         outer.set_margin_top(14)
         outer.set_margin_bottom(14)
         outer.set_margin_start(self._banner_horizontal_margin())
         outer.set_margin_end(self._banner_horizontal_margin())
 
         if notification.app_name:
-            app_lbl = Gtk.Label(label=notification.app_name)
-            self._center_label(Gtk, app_lbl)
+            if gtk_api.label_ctor is None:
+                return False
+            app_lbl = gtk_api.label_ctor(label=notification.app_name)
+            self._center_label(app_lbl)
             app_lbl.get_style_context().add_class("dim-label")
             self._box_add(outer, app_lbl)
 
         if notification.summary:
-            summary_lbl = Gtk.Label()
-            summary_lbl.set_markup(
-                f"<b>{GLib.markup_escape_text(notification.summary)}</b>"
-            )
-            self._center_label(Gtk, summary_lbl)
+            if gtk_api.label_ctor is None:
+                return False
+            summary_lbl = gtk_api.label_ctor()
+            escaped_summary = notification.summary
+            if glib_api.markup_escape_text is not None:
+                escaped_summary = glib_api.markup_escape_text(notification.summary)
+            summary_lbl.set_markup(f"<b>{escaped_summary}</b>")
+            self._center_label(summary_lbl)
             self._set_label_wrap(summary_lbl, True)
             summary_lbl.set_max_width_chars(140)
             self._box_add(outer, summary_lbl)
 
         if notification.body:
-            body_lbl = Gtk.Label(label=notification.body)
-            self._center_label(Gtk, body_lbl)
+            if gtk_api.label_ctor is None:
+                return False
+            body_lbl = gtk_api.label_ctor(label=notification.body)
+            self._center_label(body_lbl)
             self._set_label_wrap(body_lbl, True)
             body_lbl.set_max_width_chars(140)
             self._box_add(outer, body_lbl)
 
-        action_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        if hasattr(Gtk, "Align") and hasattr(Gtk.Align, "CENTER"):
-            action_row.set_halign(Gtk.Align.CENTER)
+        if gtk_api.box_ctor is None or gtk_api.orientation_horizontal is None:
+            return False
+        action_row = gtk_api.box_ctor(
+            orientation=gtk_api.orientation_horizontal,
+            spacing=6,
+        )
+        action_row_api = BoxApi.from_box(action_row)
+        if action_row_api.set_halign is not None and gtk_api.align_center is not None:
+            action_row_api.set_halign(gtk_api.align_center)
         action_pairs = self._parse_actions(notification.actions)
         if action_pairs:
             for action_key, action_label in action_pairs:
-                btn = Gtk.Button(label=action_label)
+                if gtk_api.button_ctor is None:
+                    return False
+                btn = gtk_api.button_ctor(label=action_label)
                 btn.connect(
                     "clicked",
                     self._on_action_clicked,
@@ -548,42 +667,56 @@ class BannerRenderer(_BaseGtkRenderer):
 
         return False  # don't repeat idle call
 
-    def _banner_width(self, gdk_module: Any) -> int:
-        monitor = self._get_primary_monitor(gdk_module)
-        if monitor is None or not hasattr(monitor, "get_geometry"):
+    def _banner_width(self) -> int:
+        monitor = self._get_primary_monitor()
+        if monitor is None:
             return 1600
 
-        geometry = monitor.get_geometry()
+        monitor_api = MonitorApi.from_monitor(monitor)
+        if monitor_api.get_geometry is None:
+            return 1600
+        geometry = monitor_api.get_geometry()
         return min(geometry.width, 1600)
 
-    def _banner_top_margin(self, gdk_module: Any) -> int:
-        monitor = self._get_primary_monitor(gdk_module)
-        if monitor is None or not hasattr(monitor, "get_geometry"):
+    def _banner_top_margin(self) -> int:
+        monitor = self._get_primary_monitor()
+        if monitor is None:
             return 0
 
-        geometry = monitor.get_geometry()
+        monitor_api = MonitorApi.from_monitor(monitor)
+        if monitor_api.get_geometry is None:
+            return 0
+        geometry = monitor_api.get_geometry()
         return max(0, (geometry.height - self._BANNER_HEIGHT) // 2)
 
     def _banner_horizontal_margin(self) -> int:
         return 24
 
-    def _position_fallback_window_center(self, win: Any, gdk_module: Any) -> None:
-        if not hasattr(win, "move"):
+    def _position_fallback_window_center(self, win: Any) -> None:
+        win_api = WindowApi.from_window(win)
+        if win_api.move is None:
             return
 
-        monitor = self._get_primary_monitor(gdk_module)
-        if monitor is None or not hasattr(monitor, "get_geometry"):
+        monitor = self._get_primary_monitor()
+        if monitor is None:
             return
 
-        geometry = monitor.get_geometry()
-        banner_width = self._banner_width(gdk_module)
+        monitor_api = MonitorApi.from_monitor(monitor)
+        if monitor_api.get_geometry is None:
+            return
+        geometry = monitor_api.get_geometry()
+        banner_width = self._banner_width()
         center_x = max(0, geometry.x + (geometry.width - banner_width) // 2)
         center_y = max(0, geometry.y + (geometry.height - self._BANNER_HEIGHT) // 2)
-        win.move(center_x, center_y)
+        win_api.move(center_x, center_y)
 
-    def _center_label(self, gtk_module: Any, label: Any) -> None:
+    def _center_label(self, label: Any) -> None:
         label.set_xalign(0.5)
-        if hasattr(gtk_module, "Justification") and hasattr(label, "set_justify"):
-            label.set_justify(gtk_module.Justification.CENTER)
-        if hasattr(gtk_module, "Align") and hasattr(label, "set_halign"):
-            label.set_halign(gtk_module.Align.CENTER)
+        label_api = LabelApi.from_label(label)
+        if (
+            label_api.set_justify is not None
+            and self._gtk_api.justification_center is not None
+        ):
+            label_api.set_justify(self._gtk_api.justification_center)
+        if label_api.set_halign is not None and self._gtk_api.align_center is not None:
+            label_api.set_halign(self._gtk_api.align_center)
