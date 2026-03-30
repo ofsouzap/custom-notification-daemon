@@ -6,10 +6,10 @@ from typing import Final
 import click
 
 from notifications import Notification, NotificationDaemon, run_daemon
-from renderer import OverlayRenderer, NotificationRenderer
+from renderer import BannerRenderer, ToastRenderer, NotificationRenderer
 
 
-VERSION: Final[str] = "0.1.0"
+VERSION: Final[str] = "0.2.0"
 
 
 class RendererNotificationDaemon(NotificationDaemon):
@@ -35,8 +35,10 @@ class RendererNotificationDaemon(NotificationDaemon):
 
 
 def _build_renderer(renderer_name: str) -> NotificationRenderer:
-    if renderer_name == "overlay":
-        return OverlayRenderer()
+    if renderer_name == "toast":
+        return ToastRenderer()
+    if renderer_name == "banner":
+        return BannerRenderer()
 
     raise click.ClickException(f"Unknown renderer: {renderer_name}")
 
@@ -51,18 +53,18 @@ def _renderer_option(func: click.core.F) -> click.core.F:
     return click.option(
         "--renderer",
         "renderer_name",
-        type=click.Choice(["overlay"], case_sensitive=False),
-        default="overlay",
+        type=click.Choice(["toast", "banner"], case_sensitive=False),
+        default="toast",
         show_default=True,
         help="Renderer backend to use.",
     )(func)
 
 
+@click.version_option(version=VERSION, prog_name="custom-notification-daemon")
 @click.group(
     no_args_is_help=True,
     context_settings={"help_option_names": ["-h", "--help"]},
 )
-@click.version_option(version=VERSION, prog_name="custom-notification-daemon")
 def cli() -> None:
     """Custom notification daemon for Wayland/Sway."""
     pass

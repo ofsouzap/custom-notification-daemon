@@ -20,4 +20,4 @@ Depends:
 Description: Custom freedesktop notifications daemon for Wayland/Sway
  A lightweight Python daemon implementing org.freedesktop.Notifications.
  It is tuned for Sway/Wayland and uses gtk-layer-shell when available
- to render toast-style overlays that do not reserve workspace layout.
+ to render toast-style notifications that do not reserve workspace layout.
