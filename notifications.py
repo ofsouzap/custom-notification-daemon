@@ -5,14 +5,14 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable
 
-from dbus_next.aio import MessageBus
+from dbus_next.aio.message_bus import MessageBus
 from dbus_next.service import ServiceInterface, method, signal
-from dbus_next import RequestNameReply
+from dbus_next.constants import RequestNameReply
 
 
 if TYPE_CHECKING:
     import typing
-    from dbus_next import Variant
+    from dbus_next.signature import Variant
 
     t_str = str
     t_uint32 = int

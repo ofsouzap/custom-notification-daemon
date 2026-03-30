@@ -18,8 +18,8 @@ Update the TODO section below whenever scope or status changes.
 - `apt-dependencies.txt`: required apt runtime dependencies.
 - `apt-dev-dependencies.txt`: apt development/build dependencies.
 - `requirements.txt`: Python dependencies.
-- `typings/`: local stubs for GI introspection modules used by type checker.
-- `pyrightconfig.json`: points pyright to local stubs.
+- `gi_support/wrappers.py`: typed wrappers for optional GI APIs and constants.
+- `pyrightconfig.json`: pyright settings for GI-heavy environment.
 - `debian/`: Debian packaging files for `.deb` builds.
 
 ## Runtime Behavior Notes
@@ -62,10 +62,9 @@ python main.py run
 ## Type Checking Notes
 
 - GI imports are dynamic (`gi.repository`) and not fully statically discoverable.
-- Local minimal stubs are intentionally partial, only for symbols used here.
-- `pyrightconfig.json` uses:
-  - `stubPath: typings`
-  - `reportMissingModuleSource: none`
+- Optional GI methods/constants are wrapped in `gi_support/wrappers.py` and typed as nullable callables/values.
+- Renderer code should use wrappers instead of ad-hoc `hasattr` checks for optional API paths.
+- `pyrightconfig.json` keeps `reportMissingModuleSource: none` to reduce GI import noise.
 
 ## Quick Troubleshooting
 
