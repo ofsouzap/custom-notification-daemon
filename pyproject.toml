@@ -1,0 +1,17 @@
+[tool.pyright]
+exclude = [
+    "**/node_modules",
+    "**/.*",
+    "**/__pycache__",
+    ".venv",
+    ".ruff_cache",
+    ".setup-venv",
+    "build",
+    "dist",
+    "build-artifacts",
+    "debian",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"

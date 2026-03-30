@@ -1,4 +1,5 @@
 click>=8.1.0
 black>=26.0.0
+pyright>=1.1.0
 pytest>=9.0.0
 ruff>=0.15.0

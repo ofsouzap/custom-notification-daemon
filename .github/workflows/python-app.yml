@@ -1,0 +1,38 @@
+name: Python application
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v6
+      with:
+        python-version: "3.12"
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install ruff pyright
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+    - name: Lint with ruff
+      run: |
+        ruff check .
+
+    - name: Type check with pyright
+      run: |
+        pyright .
